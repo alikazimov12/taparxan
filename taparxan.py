@@ -5,7 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 
-TOKEN = "8427693315:AAHrqQKu1ABD_dZcJA8PVF6_l66owypoW6c"
+TOKEN = "7220809094:AAGrFIo925lYz0eXKyqOU_ost87p-mQt2vM"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
