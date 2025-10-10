@@ -143,7 +143,7 @@ async def hourly_job():
                     except Exception as e:
                         print(f"[DEBUG] Xəta {chat_id} göndərərkən: {e}")
         print("[DEBUG] 1 saat gözlənilir...\n")
-        await asyncio.sleep(3600)
+        await asyncio.sleep(50)
 
 async def main():
     await asyncio.gather(
