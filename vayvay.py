@@ -1,35 +1,31 @@
+#!/usr/bin/env python3
 import asyncio
 import json
 import datetime
 import random
 import time
-import requests
+import itertools
+from typing import Optional
+
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 
-# Optional cloudscraper fallback (install with `pip install cloudscraper`)
-try:
-    import cloudscraper
-    HAS_CLOUDSCRAPER = True
-except Exception:
-    HAS_CLOUDSCRAPER = False
+# cloudscraper is used to bypass Cloudflare JS challenges
+import cloudscraper
+import requests  # used only for exceptions typing maybe
 
 # ---------------- CONFIG ----------------
-TOKEN = "8427693315:AAHrqQKu1ABD_dZcJA8PVF6_l66owypoW6c"
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
+TOKEN = "8427693315:AAHrqQKu1ABD_dZcJA8PVF6_l66owypoW6c"  # <-- buraya token qoy
+SUBSCRIBERS_FILE = "subscribers.json"
 BASE_URL = "https://tap.az/elanlar/elektronika/noutbuklar"
-subscribers_file = "subscribers.json"
 
-# Put your proxies here as strings "http://ip:port" or "http://user:pass@ip:port".
-# Leave empty list to try without proxies.
+# Optional proxy list (http format). Əgər proxy istəmirsənsə boş saxla.
 PROXIES = [
-    # "http://167.86.74.155:21966",
     # "http://user:pass@1.2.3.4:8080",
+    # "http://167.86.74.155:21966",
 ]
 
-# User-Agent rotation
+# UA rotation
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
@@ -37,301 +33,255 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
 ]
 
-# Runtime / behavior parameters
-MAX_PROXY_TRIES = 4
-REQUEST_TIMEOUT = 15  # seconds
-MIN_REQUEST_DELAY = 0.5
-MAX_REQUEST_DELAY = 1.2
+# runtime behavior
+PAGES_TO_SCRAPE = 3
+CHECK_INTERVAL = 60  # seconds between cycles (1 hour). Test üçün azalda bilərsən.
+MIN_DELAY = 1.0
+MAX_DELAY = 2.0
+REQUEST_TIMEOUT = 20
+
+# ---------------- global state ----------------
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
 subscribers = set()
-seen_ads = set()
-start_time = datetime.datetime.now()
+seen_urls = set()         # runtime-da hansı elanlar göndərilib (yenidən göndərməmək üçün)
+START_TIME = datetime.datetime.now()
+print(f"[DEBUG] Bot start vaxtı: {START_TIME.isoformat()}")
 
-# ---------------- helper: subscribers persistence ----------------
+# cloudscraper session yarat (Cloudflare bypass)
+SCRAPER = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+)
+
+# proxy cycle
+proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
+
+
+# ---------------- helpers ----------------
 def load_subscribers():
     global subscribers
     try:
-        with open(subscribers_file, "r") as f:
+        with open(SUBSCRIBERS_FILE, "r") as f:
             subscribers = set(json.load(f))
-    except Exception:
+            print(f"[DEBUG] Loaded {len(subscribers)} subscribers.")
+    except FileNotFoundError:
+        subscribers = set()
+    except Exception as e:
+        print(f"[DEBUG] Failed loading subscribers: {e}")
         subscribers = set()
 
+
 def save_subscribers():
-    with open(subscribers_file, "w") as f:
-        json.dump(list(subscribers), f)
+    try:
+        with open(SUBSCRIBERS_FILE, "w") as f:
+            json.dump(list(subscribers), f)
+    except Exception as e:
+        print(f"[DEBUG] Failed saving subscribers: {e}")
 
-load_subscribers()
 
-# ---------------- session & proxy rotation ----------------
-session = requests.Session()
-
-# Shuffle proxies once
-if PROXIES:
-    random.shuffle(PROXIES)
-proxy_index = 0
-
-def next_proxy():
-    global proxy_index
-    if not PROXIES:
+def next_proxy() -> Optional[str]:
+    if not proxy_cycle:
         return None
-    proxy = PROXIES[proxy_index % len(PROXIES)]
-    proxy_index += 1
-    return proxy
+    return next(proxy_cycle)
 
-def get_headers():
+
+def get_headers() -> dict:
     ua = random.choice(USER_AGENTS)
-    headers = {
+    return {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "az,en-US;q=0.9,en;q=0.8",
         "Referer": "https://tap.az/",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "DNT": "1",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
     }
-    return headers
+
 
 def detect_cloudflare_body(text: str) -> bool:
     t = (text or "").lower()
     return ("cf-browser-verification" in t) or ("attention required!" in t) or ("cloudflare" in t and "check" in t)
 
-def perform_request(url, method="GET", params=None, data=None, max_tries=MAX_PROXY_TRIES):
-    """
-    Try requests with rotating proxies and UA rotation.
-    If Cloudflare JS challenge detected and cloudscraper available, try cloudscraper once.
-    Returns response.text on success, raises last exception on failure.
-    """
-    last_exc = None
-    tries = 0
 
-    # first try: try different proxies (or no proxy if PROXIES empty)
-    while tries < max_tries:
-        proxy = next_proxy() if PROXIES else None
-        proxies = None
-        if proxy:
-            proxies = {"http": proxy, "https": proxy}
+# Blocking network call but wrapped with cloudscraper; we'll call it via asyncio.to_thread
+def blocking_request(url: str, params: dict = None, proxy: Optional[str] = None):
+    headers = get_headers()
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+    # polite small sleep to avoid rapid-fire pattern
+    time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+    print(f"[DEBUG] Requesting {url} proxy={proxy} UA={headers['User-Agent']}")
+    resp = SCRAPER.get(url, headers=headers, params=params, proxies=proxies, timeout=REQUEST_TIMEOUT)
+    # detect cloudflare in body
+    if detect_cloudflare_body(resp.text):
+        raise RuntimeError("Cloudflare challenge detected in response body")
+    resp.raise_for_status()
+    return resp
 
-        headers = get_headers()
 
-        try:
-            # polite random small delay
-            time.sleep(random.uniform(MIN_REQUEST_DELAY, MAX_REQUEST_DELAY))
-            print(f"[DEBUG] Requesting {url} (try {tries+1}/{max_tries}) proxy={proxy} UA={headers['User-Agent']}")
-            resp = session.request(method, url, headers=headers, params=params, data=data, timeout=REQUEST_TIMEOUT, proxies=proxies)
-            # If status code 403 or 429, treat as fail and try next proxy
-            if resp.status_code == 403 or resp.status_code == 429:
-                print(f"[DEBUG] Received status {resp.status_code} for {url} with proxy={proxy}")
-                last_exc = requests.HTTPError(f"Status {resp.status_code}")
-                tries += 1
-                time.sleep(0.5 + tries * 0.3)
-                continue
-
-            # detect Cloudflare or challenge page inside body
-            if detect_cloudflare_body(resp.text):
-                print("[DEBUG] Cloudflare-like page detected in body.")
-                last_exc = requests.HTTPError("Cloudflare challenge detected")
-                tries += 1
-                time.sleep(0.5 + tries * 0.3)
-                continue
-
-            resp.raise_for_status()
-            return resp
-
-        except Exception as e:
-            print(f"[DEBUG] Request attempt failed (proxy={proxy}): {e}")
-            last_exc = e
-            tries += 1
-            time.sleep(0.5 + tries * 0.3)
-
-    # If all proxy tries exhausted, try cloudscraper fallback once (if available)
-    if HAS_CLOUDSCRAPER:
-        try:
-            print("[DEBUG] Trying cloudscraper fallback...")
-            scraper = cloudscraper.create_scraper(browser={'custom': get_headers()['User-Agent']})
-            # cloudscraper accepts proxies param similar to requests
-            proxy_for_cs = None if not PROXIES else {"http": PROXIES[0], "https": PROXIES[0]}
-            resp = scraper.request(method, url, params=params, data=data, timeout=REQUEST_TIMEOUT, proxies=proxy_for_cs)
-            if detect_cloudflare_body(resp.text):
-                raise RuntimeError("Cloudscraper could not bypass Cloudflare")
-            return resp
-        except Exception as e:
-            print(f"[DEBUG] cloudscraper fallback failed: {e}")
-            last_exc = e
-
-    # final fallback: try without proxy once
+# check ad page if shop button exists (blocking, use in thread)
+def blocking_is_shop_ad(ad_url: str, proxy: Optional[str] = None) -> bool:
     try:
-        print("[DEBUG] Final fallback: try without proxy and default headers")
-        headers = get_headers()
-        resp = session.request(method, url, headers=headers, params=params, data=data, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        if detect_cloudflare_body(resp.text):
-            raise RuntimeError("Cloudflare detected in final fallback")
-        return resp
-    except Exception as e:
-        print(f"[DEBUG] Final fallback failed: {e}")
-        last_exc = e
-
-    # if everything failed, raise last exception
-    raise last_exc
-
-# ---------------- check ad page for shop button ----------------
-def is_shop_ad(ad_url):
-    """Elanın səhifəsinə girib yoxlayır, mağaza linki varsa True qaytarır"""
-    try:
-        r = perform_request(ad_url)
+        r = blocking_request(ad_url, proxy=proxy)
         soup = BeautifulSoup(r.text, "html.parser")
-        shop_link = soup.select_one('a[data-stat="shop-ad-go-shop-btn"]')
-        if shop_link:
-            print(f"[DEBUG] Mağaza elanı tapıldı, çıxarılır: {ad_url}")
+        el = soup.select_one('a[data-stat="shop-ad-go-shop-btn"]')
+        if el:
+            print(f"[DEBUG] Mağaza elanı tapıldı: {ad_url}")
             return True
     except Exception as e:
-        print(f"[DEBUG] Xəta yoxlananda {ad_url}: {e}")
+        # on error, print and return False (we choose to include ad if check fails)
+        print(f"[DEBUG] is_shop_ad error for {ad_url}: {e}")
+        return False
     return False
 
-# ---------------- fetch listing page, filter by "bugün" and start_time ----------------
-def fetch_page(cursor=None):
-    params = {
-        "keywords_source": "typewritten",
-        "order": "newest",
-    }
+
+# fetch a single listing page, return ads list and next cursor
+def blocking_fetch_page(cursor: Optional[str] = None):
+    params = {"keywords_source": "typewritten", "order": "newest"}
     if cursor:
         params["cursor"] = cursor
 
-    # build URL with params for debug printing
-    url = BASE_URL
-    if cursor:
-        url = BASE_URL + "?cursor=" + cursor
+    proxy = next_proxy() if proxy_cycle else None
 
     try:
-        r = perform_request(url, params=params)
+        resp = blocking_request(BASE_URL, params=params, proxy=proxy)
     except Exception as e:
         print(f"[ERROR] Failed to fetch listing page: {e}")
         return [], None
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "html.parser")
     ads = []
 
     for card in soup.select(".products-i"):
-        # quick filter: skip if listing-level indicates store (optional)
+        # listing-level quick skip
         if "products-shop" in (card.get("class") or []):
-            print("[DEBUG] Skipping card due to products-shop class (listing-level)")
+            print("[DEBUG] Skip card with products-shop class (listing-level).")
             continue
 
-        title = card.select_one(".products-name")
-        price = card.select_one(".products-price .price-val")
-        link = card.select_one("a[href]")
-        date_div = card.select_one(".products-created")
-
-        if not link or not date_div:
+        date_tag = card.select_one(".products-created")
+        if not date_tag:
+            continue
+        date_text = date_tag.text.strip().lower()  # e.g. "bakı, bugün, 16:19"
+        if "bugün" not in date_text:
             continue
 
-        date_text = date_div.text.strip()  # e.g. "Bakı, bugün, 16:19"
-        if "bugün" not in date_text.lower():
-            # not today's ad — skip
-            continue
-
+        # parse time part
         try:
-            hour_min = date_text.split(",")[-1].strip()
-            ad_time = datetime.datetime.combine(
-                start_time.date(),
-                datetime.datetime.strptime(hour_min, "%H:%M").time()
-            )
+            time_part = date_text.split(",")[-1].strip()
+            t = datetime.datetime.strptime(time_part, "%H:%M").time()
+            ad_dt = datetime.datetime.combine(START_TIME.date(), t)
         except Exception:
-            # parse error — skip
             continue
 
-        if ad_time < start_time:
-            # placed before bot start — skip
+        if ad_dt < START_TIME:
+            # posted before bot start
             continue
 
-        ad_url = "https://tap.az" + link["href"]
+        link_tag = card.select_one("a[href]")
+        if not link_tag:
+            continue
+        href = link_tag.get("href")
+        if not href:
+            continue
+        ad_url = "https://tap.az" + href
 
-        # check if it's a shop ad by visiting ad page (this uses rotating proxies)
-        try:
-            if is_shop_ad(ad_url):
-                # skip store ads
-                continue
-        except Exception as e:
-            print(f"[DEBUG] Error while checking shop status for {ad_url}: {e}")
-            # conservative choice: if check fails, skip including to avoid false positives OR include — choose include here:
-            # continue  # <-- if you prefer to skip on error uncomment this
-            pass
+        # check inside ad page for shop button (blocking)
+        proxy_for_ad = next_proxy() if proxy_cycle else None
+        if blocking_is_shop_ad(ad_url, proxy=proxy_for_ad):
+            continue
 
-        ads.append({
-            "title": title.text.strip() if title else "No title",
-            "price": price.text.strip() if price else "No price",
-            "url": ad_url
-        })
+        title = (card.select_one(".products-name").get_text(strip=True)
+                 if card.select_one(".products-name") else "No title")
+        price = (card.select_one(".products-price .price-val").get_text(strip=True)
+                 if card.select_one(".products-price .price-val") else "No price")
 
-    # extract cursor from response URL if present
+        ads.append({"title": title, "price": price, "url": ad_url})
+
+    # try to extract cursor from response final url
     new_cursor = None
     try:
-        final_url = r.url if r is not None else url
+        final_url = resp.url
         if "cursor=" in final_url:
             new_cursor = final_url.split("cursor=")[-1]
-    except:
+    except Exception:
         new_cursor = None
 
     print(f"[DEBUG] Fetched page, {len(ads)} elan tapıldı")
     return ads, new_cursor
 
-# ---------------- scrape multiple pages ----------------
-def scrape_all(pages=3):
+
+# synchronous scrape_all wrapper (will be called inside a thread)
+def blocking_scrape_all(pages: int = PAGES_TO_SCRAPE):
     all_ads = []
     cursor = None
     for i in range(pages):
-        ads, cursor = fetch_page(cursor)
+        ads, cursor = blocking_fetch_page(cursor)
         if not ads:
-            print(f"[DEBUG] No ads found on page {i+1}")
+            print(f"[DEBUG] No ads found on listing page {i+1}")
             break
         all_ads.extend(ads)
         print(f"[DEBUG] Page {i+1}: {len(ads)} elan tapıldı")
-        # polite pause between pages
-        time.sleep(random.uniform(1.0, 2.0))
+        # small polite pause between pages
+        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
     return all_ads
 
-# ---------------- telegram handlers & loop ----------------
+
+# ---------------- Telegram handlers & asyncio job ----------------
 @dp.message()
-async def cmd_start(message: types.Message):
-    if message.chat.id not in subscribers:
-        subscribers.add(message.chat.id)
-        save_subscribers()
-        print(f"[DEBUG] New subscriber: {message.chat.id}")
-    await message.answer("Salam! Sən artıq yeni elanlara abunəsən.")
+async def on_message(message: types.Message):
+    if message.text and message.text.strip().lower() == "/start":
+        if message.chat.id not in subscribers:
+            subscribers.add(message.chat.id)
+            save_subscribers()
+            print(f"[DEBUG] New subscriber: {message.chat.id}")
+        await message.reply("Salam! Abunə oldunuz — yalnız bu andan sonra gələn elanları alacaqsınız.")
+
 
 async def hourly_job():
-    global seen_ads
     while True:
         print("[DEBUG] Yeni elanlar yoxlanılır...")
-        new_ads = scrape_all()
-        fresh_ads = []
+        # run blocking scraping in thread to avoid blocking event loop
+        try:
+            new_ads = await asyncio.to_thread(blocking_scrape_all, PAGES_TO_SCRAPE)
+        except Exception as e:
+            print(f"[ERROR] Scrape cycle failed: {e}")
+            new_ads = []
+
+        fresh = []
         for ad in new_ads:
-            if ad["url"] not in seen_ads:
-                seen_ads.add(ad["url"])
-                fresh_ads.append(ad)
-        if fresh_ads:
-            for ad in fresh_ads:
+            if ad["url"] not in seen_urls:
+                seen_urls.add(ad["url"])
+                fresh.append(ad)
+
+        if fresh:
+            for ad in fresh:
                 text = f"🆕 Yeni elan:\n{ad['title']} | {ad['price']}\n{ad['url']}"
-                for chat_id in subscribers:
+                for chat_id in list(subscribers):
                     try:
                         await bot.send_message(chat_id, text)
-                        print(f"[DEBUG] Sent to {chat_id}: {ad['url']}")
+                        print(f"[DEBUG] Sent ad to {chat_id}: {ad['url']}")
                     except Exception as e:
-                        print(f"[DEBUG] Xəta {chat_id} göndərərkən: {e}")
-        print("[DEBUG] Sleeping 1 hour...\n")
-        await asyncio.sleep(60)
+                        print(f"[DEBUG] Error sending to {chat_id}: {e}")
+        else:
+            print("[DEBUG] No new ads this cycle.")
+
+        print(f"[DEBUG] Növbəti yoxlama {CHECK_INTERVAL} saniyə sonra.")
+        await asyncio.sleep(CHECK_INTERVAL)
+
 
 async def main():
+    load_subscribers()
+    # start hourly_job + bot polling
     await asyncio.gather(
         dp.start_polling(bot),
         hourly_job()
     )
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Exiting...")
 
