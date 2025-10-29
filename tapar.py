@@ -224,7 +224,7 @@ async def hourly_job():
         else:
             print("[DEBUG] No new ads this cycle.")
         print("[DEBUG] 1 saat gözlənilir...\n")
-        await asyncio.sleep(3600)  # realda 3600; test üçün dəyişə bilərsən
+        await asyncio.sleep(60)  # realda 3600; test üçün dəyişə bilərsən
 
 async def main():
     await asyncio.gather(
