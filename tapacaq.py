@@ -1,8 +1,8 @@
 import asyncio
 import json
-import datetime
 import random
 import requests
+import datetime
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from faker import Faker
@@ -67,33 +67,55 @@ def save_json(path, data):
 subscribers = load_json(SUBSCRIBERS_FILE)
 seen_ads = load_json(SEEN_FILE)
 
+# ================= HTTP (403/429 GÖRÜNƏN) =================
+
+def safe_get(url, **kwargs):
+    try:
+        r = session.get(url, **kwargs)
+        log(f"HTTP {r.status_code} → {r.url}", "HTTP")
+
+        if r.status_code == 403:
+            log("403 FORBIDDEN – IP / UA FLAGGED ⚠️", "ERROR")
+        elif r.status_code == 429:
+            log("429 TOO MANY REQUESTS – RATE LIMIT ⚠️", "ERROR")
+
+        r.raise_for_status()
+        return r
+
+    except requests.exceptions.RequestException as e:
+        log(f"REQUEST ERROR → {e}", "ERROR")
+        return None
+
 # ================= SCRAPER =================
 
 def is_shop_ad_sync(url):
-    try:
-        r = session.get(url, headers=random_headers(), timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        if soup.select_one('a[data-stat="shop-ad-go-shop-btn"]'):
-            log(f"Mağaza elanı çıxarıldı → {url}", "SHOP")
-            return True
+    r = safe_get(url, headers=random_headers(), timeout=10)
+    if not r:
+        log("Shop yoxlaması alınmadı", "ERROR")
         return False
-    except Exception as e:
-        log(f"Shop yoxlama xətası → {e}", "ERROR")
-        return False
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    if soup.select_one('a[data-stat="shop-ad-go-shop-btn"]'):
+        log(f"Mağaza elanı çıxarıldı → {url}", "SHOP")
+        return True
+    return False
 
 def fetch_page_sync():
     log("Tap.az səhifəsi çəkilir...")
 
-    r = session.get(
+    r = safe_get(
         BASE_URL,
         headers=random_headers(),
         params={"order": "newest"},
         timeout=15
     )
 
+    if not r:
+        log("Listing səhifəsi alınmadı", "ERROR")
+        return []
+
     soup = BeautifulSoup(r.text, "html.parser")
     cards = soup.select(".products-i")
-
     log(f"Səhifədə {len(cards)} kart tapıldı")
 
     ads = []
@@ -158,10 +180,8 @@ async def monitor_loop():
         try:
             ads = await fetch_page()
         except Exception as e:
-            log(f"Scrape xətası → {e}", "ERROR")
+            log(f"Scrape crash → {e}", "ERROR")
             ads = []
-
-        new_count = 0
 
         for ad in ads:
             if ad["url"] in seen_ads:
@@ -184,11 +204,7 @@ async def monitor_loop():
                 except Exception as e:
                     log(f"Telegram error → {e}", "ERROR")
 
-            new_count += 1
-
-        log(f"Dövr bitdi | Yeni elan: {new_count}")
-        log("Növbəti yoxlama gözlənilir...\n")
-
+        log("Dövr bitdi\n")
         await asyncio.sleep(random.randint(CHECK_INTERVAL_MIN, CHECK_INTERVAL_MAX))
 
 async def main():
@@ -199,4 +215,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
